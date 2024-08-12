@@ -16,7 +16,9 @@
 
 package object
 
-const DefaultStorageClass = "STANDARD"
+import "github.com/aws/aws-sdk-go-v2/service/s3/types"
+
+const DefaultStorageClass = types.StorageClassStandard
 
 type SupportStorageClass interface {
 	SetStorageClass(sc string) error

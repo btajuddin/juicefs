@@ -34,7 +34,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
-	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
 type wasb struct {
@@ -85,7 +85,7 @@ func (b *wasb) Get(key string, off, limit int64, getters ...AttrGetter) (io.Read
 	}
 	attrs := applyGetters(getters...)
 	// TODO fire another property request to get the actual storage class
-	attrs.SetRequestID(aws.StringValue(download.RequestID)).SetStorageClass(b.sc)
+	attrs.SetRequestID(aws.ToString(download.RequestID)).SetStorageClass(b.sc)
 	return download.Body, err
 }
 
@@ -105,7 +105,7 @@ func (b *wasb) Put(key string, data io.Reader, getters ...AttrGetter) error {
 	}
 	resp, err := b.azblobCli.UploadStream(ctx, b.cName, key, data, &options)
 	attrs := applyGetters(getters...)
-	attrs.SetRequestID(aws.StringValue(resp.RequestID)).SetStorageClass(b.sc)
+	attrs.SetRequestID(aws.ToString(resp.RequestID)).SetStorageClass(b.sc)
 	return err
 }
 
@@ -132,7 +132,7 @@ func (b *wasb) Delete(key string, getters ...AttrGetter) error {
 		}
 	}
 	attrs := applyGetters(getters...)
-	attrs.SetRequestID(aws.StringValue(resp.RequestID))
+	attrs.SetRequestID(aws.ToString(resp.RequestID))
 	return err
 }
 

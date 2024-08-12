@@ -24,10 +24,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 type jss struct {
@@ -46,9 +44,9 @@ func (j *jss) Copy(dst, src string) error {
 		CopySource: &src,
 	}
 	if j.sc != "" {
-		params.SetStorageClass(j.sc)
+		params.StorageClass = types.StorageClass(j.sc)
 	}
-	_, err := j.s3client.s3.CopyObject(params)
+	_, err := j.s3client.s3.CopyObject(ctx, params)
 	return err
 }
 
@@ -63,21 +61,13 @@ func newJSS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 	region := hostParts[2]
 	endpoint = uri.Host[len(bucket)+1:]
 
-	awsConfig := &aws.Config{
-		Region:           &region,
-		Endpoint:         &endpoint,
-		DisableSSL:       aws.Bool(!ssl),
-		S3ForcePathStyle: aws.Bool(true),
-		HTTPClient:       httpClient,
-		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, token),
+	var options = []func(*s3.Options){disableSha256, usePathStyle}
+	if !ssl {
+		options = append(options, disableHttps)
 	}
 
-	ses, err := session.NewSession(awsConfig)
-	if err != nil {
-		return nil, err
-	}
-	ses.Handlers.Build.PushFront(disableSha256Func)
-	return &jss{s3client{bucket: bucket, s3: s3.New(ses), ses: ses}}, nil
+	client, err := newS3Client(region, bucket, "", endpoint, false, accessKey, secretKey, token, options...)
+	return &jss{client}, err
 }
 
 func init() {

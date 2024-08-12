@@ -25,10 +25,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 type eos struct {
@@ -73,21 +70,16 @@ func newEos(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 		token = os.Getenv("EOS_TOKEN")
 	}
 
-	awsConfig := &aws.Config{
-		Endpoint:         &endpoint,
-		Region:           &region,
-		DisableSSL:       aws.Bool(!ssl),
-		S3ForcePathStyle: aws.Bool(defaultPathStyle()),
-		HTTPClient:       httpClient,
-		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, token),
+	var options = []func(*s3.Options){disableSha256}
+	if defaultPathStyle() {
+		options = append(options, usePathStyle)
+	}
+	if !ssl {
+		options = append(options, disableHttps)
 	}
 
-	ses, err := session.NewSession(awsConfig)
-	if err != nil {
-		return nil, fmt.Errorf("aws session: %s", err)
-	}
-	ses.Handlers.Build.PushFront(disableSha256Func)
-	return &eos{s3client{bucket: bucket, s3: s3.New(ses), ses: ses}}, nil
+	client, err := newS3Client(region, bucket, "", endpoint, false, accessKey, secretKey, token, options...)
+	return &eos{client}, err
 }
 
 func init() {
