@@ -25,10 +25,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 type minio struct {
@@ -36,7 +35,7 @@ type minio struct {
 }
 
 func (m *minio) String() string {
-	return fmt.Sprintf("minio://%s/%s/", *m.s3client.ses.Config.Endpoint, m.s3client.bucket)
+	return fmt.Sprintf("minio://%s/%s/", *m.s3client.s3.Options().BaseEndpoint, m.s3client.bucket)
 }
 
 func (m *minio) Limits() Limits {
@@ -65,12 +64,9 @@ func newMinio(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 	if region == "" {
 		region = awsDefaultRegion
 	}
-	awsConfig := &aws.Config{
-		Region:           aws.String(region),
-		Endpoint:         &uri.Host,
-		DisableSSL:       aws.Bool(!ssl),
-		S3ForcePathStyle: aws.Bool(defaultPathStyle()),
-		HTTPClient:       httpClient,
+	awsConfig := aws.Config{
+		Region:     region,
+		HTTPClient: httpClient,
 	}
 	if accessKey == "" {
 		accessKey = os.Getenv("MINIO_ACCESS_KEY")
@@ -79,14 +75,8 @@ func newMinio(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 		secretKey = os.Getenv("MINIO_SECRET_KEY")
 	}
 	if accessKey != "" {
-		awsConfig.Credentials = credentials.NewStaticCredentials(accessKey, secretKey, token)
+		awsConfig.Credentials = credentials.NewStaticCredentialsProvider(accessKey, secretKey, token)
 	}
-
-	ses, err := session.NewSession(awsConfig)
-	if err != nil {
-		return nil, err
-	}
-	ses.Handlers.Build.PushFront(disableSha256Func)
 
 	if len(uri.Path) < 2 {
 		return nil, fmt.Errorf("no bucket name provided in %s", endpoint)
@@ -96,7 +86,8 @@ func newMinio(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 		bucket = bucket[len("minio/"):]
 	}
 	bucket = strings.Split(bucket, "/")[0]
-	return &minio{s3client{bucket: bucket, s3: s3.New(ses), ses: ses}}, nil
+
+	return &minio{s3client{bucket: bucket, s3: s3.NewFromConfig(awsConfig, reduceChecksumCalculations, endpointOptions(uri.Host, !ssl, defaultPathStyle()))}}, nil
 }
 
 func init() {

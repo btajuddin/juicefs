@@ -21,9 +21,11 @@ package object
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"github.com/aws/smithy-go"
+	middleware2 "github.com/aws/smithy-go/middleware"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -33,33 +35,61 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/juicedata/juicefs/pkg/utils"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/middleware"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 const awsDefaultRegion = "us-east-1"
 const s3RequestIDKey = "X-Amz-Request-Id"
 
-var disableSha256Func = func(r *request.Request) {
-	if op := r.Operation.Name; r.ClientInfo.ServiceID != "S3" || !(op == "PutObject" || op == "UploadPart") {
-		return
+var reduceCalculationsMiddleware = middleware2.FinalizeMiddlewareFunc(
+	"reduce-checksum-calcs",
+	func(ctx2 context.Context, input middleware2.FinalizeInput, handler middleware2.FinalizeHandler) (middleware2.FinalizeOutput, middleware2.Metadata, error) {
+		service := middleware2.GetServiceID(ctx2)
+		op := middleware2.GetOperationName(ctx2)
+
+		if service == "S3" && (op == "PutObject" || op == "UploadPart") && v4.GetPayloadHash(ctx2) == "" {
+			// As of writing this, the handler for ComputePayloadSHA256 will check the hash in the context before
+			// calculating anything. If the value there is non-empty, the middleware will short-circuit and not
+			// run the calculation.
+			v4.SetPayloadHash(ctx2, "UNSIGNED-PAYLOAD")
+		}
+
+		return handler.HandleFinalize(ctx, input)
+	},
+)
+
+var reduceChecksumCalculations = func(options *s3.Options) {
+	options.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+	options.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+
+	options.APIOptions = append(
+		options.APIOptions,
+		func(stack *middleware2.Stack) error {
+			return stack.Finalize.Add(reduceCalculationsMiddleware, middleware2.Before)
+		},
+	)
+}
+
+func endpointOptions(endpoint string, disableSsl bool, usePathStyle bool) func(*s3.Options) {
+	return func(options *s3.Options) {
+		options.BaseEndpoint = &endpoint
+		options.EndpointOptions.DisableHTTPS = disableSsl
+		options.UsePathStyle = usePathStyle
 	}
-	if len(r.HTTPRequest.Header.Get("X-Amz-Content-Sha256")) != 0 {
-		return
-	}
-	r.HTTPRequest.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
 }
 
 type s3client struct {
 	bucket          string
 	sc              string
-	s3              *s3.S3
-	ses             *session.Session
+	s3              *s3.Client
 	disableChecksum bool
 }
 
@@ -78,15 +108,16 @@ func (s *s3client) Limits() Limits {
 }
 
 func isExists(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, s3.ErrCodeBucketAlreadyExists) || strings.Contains(msg, s3.ErrCodeBucketAlreadyOwnedByYou)
+	var exists types.BucketAlreadyExists
+	var owned types.BucketAlreadyOwnedByYou
+	return errors.Is(err, &exists) || errors.Is(err, &owned)
 }
 
 func (s *s3client) Create() error {
 	if _, _, _, err := s.List("", "", "", "", 1, true); err == nil {
 		return nil
 	}
-	_, err := s.s3.CreateBucket(&s3.CreateBucketInput{Bucket: &s.bucket})
+	_, err := s.s3.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &s.bucket})
 	if err != nil && isExists(err) {
 		err = nil
 	}
@@ -98,16 +129,17 @@ func (s *s3client) Head(key string) (Object, error) {
 		Bucket: &s.bucket,
 		Key:    &key,
 	}
-	r, err := s.s3.HeadObject(&param)
+	r, err := s.s3.HeadObject(ctx, &param)
 	if err != nil {
-		if e, ok := err.(awserr.RequestFailure); ok && e.StatusCode() == http.StatusNotFound {
+		var failure types.NotFound
+		if errors.Is(err, &failure) {
 			err = os.ErrNotExist
 		}
 		return nil, err
 	}
 	var sc = DefaultStorageClass
-	if r.StorageClass != nil {
-		sc = *r.StorageClass
+	if r.StorageClass != "" {
+		sc = string(r.StorageClass)
 	}
 	return &obj{
 		key,
@@ -129,25 +161,29 @@ func (s *s3client) Get(key string, off, limit int64, getters ...AttrGetter) (io.
 		}
 		params.Range = &r
 	}
-	var reqID string
-	resp, err := s.s3.GetObjectWithContext(ctx, params, request.WithGetResponseHeader(s3RequestIDKey, &reqID))
+	resp, err := s.s3.GetObject(ctx, params)
 	attrs := applyGetters(getters...)
-	attrs.SetRequestID(reqID)
 	if err != nil {
 		return nil, err
 	}
+
+	reqID, reqIDSet := middleware.GetRequestIDMetadata(resp.ResultMetadata)
+	if reqIDSet {
+		attrs.SetRequestID(reqID)
+	}
+
 	if off == 0 && limit == -1 {
 		cs := resp.Metadata[checksumAlgr]
 		var length int64 = -1
 		if resp.ContentLength != nil {
 			length = *resp.ContentLength
 		}
-		if cs != nil {
-			resp.Body = verifyChecksum(resp.Body, *cs, length)
+		if cs != "" {
+			resp.Body = verifyChecksum(resp.Body, cs, length)
 		}
 	}
-	if resp.StorageClass != nil {
-		attrs.SetStorageClass(*resp.StorageClass)
+	if resp.StorageClass != "" {
+		attrs.SetStorageClass(string(resp.StorageClass))
 	}
 	return resp.Body, nil
 }
@@ -172,15 +208,21 @@ func (s *s3client) Put(key string, in io.Reader, getters ...AttrGetter) error {
 	}
 	if !s.disableChecksum {
 		checksum := generateChecksum(body)
-		params.Metadata = map[string]*string{checksumAlgr: &checksum}
+		params.Metadata = map[string]string{checksumAlgr: checksum}
 	}
 	if s.sc != "" {
-		params.SetStorageClass(s.sc)
+		params.StorageClass = types.StorageClass(s.sc)
 	}
-	var reqID string
-	_, err := s.s3.PutObjectWithContext(ctx, params, request.WithGetResponseHeader(s3RequestIDKey, &reqID))
+	resp, err := s.s3.PutObject(ctx, params)
 	attrs := applyGetters(getters...)
-	attrs.SetRequestID(reqID).SetStorageClass(s.sc)
+	if err != nil {
+		return err
+	}
+	attrs.SetStorageClass(s.sc)
+	reqID, reqIDSet := middleware.GetRequestIDMetadata(resp.ResultMetadata)
+	if reqIDSet {
+		attrs.SetRequestID(reqID)
+	}
 	return err
 }
 
@@ -192,9 +234,9 @@ func (s *s3client) Copy(dst, src string) error {
 		CopySource: &src,
 	}
 	if s.sc != "" {
-		params.SetStorageClass(s.sc)
+		params.StorageClass = types.StorageClass(s.sc)
 	}
-	_, err := s.s3.CopyObject(params)
+	_, err := s.s3.CopyObject(ctx, params)
 	return err
 }
 
@@ -203,13 +245,17 @@ func (s *s3client) Delete(key string, getters ...AttrGetter) error {
 		Bucket: &s.bucket,
 		Key:    &key,
 	}
-	var reqID string
-	_, err := s.s3.DeleteObjectWithContext(ctx, &param, request.WithGetResponseHeader(s3RequestIDKey, &reqID))
+	resp, err := s.s3.DeleteObject(ctx, &param)
 	if err != nil && strings.Contains(err.Error(), "NoSuchKey") {
 		err = nil
+	} else if err != nil {
+		return err
 	}
 	attrs := applyGetters(getters...)
-	attrs.SetRequestID(reqID)
+	reqID, reqIDSet := middleware.GetRequestIDMetadata(resp.ResultMetadata)
+	if reqIDSet {
+		attrs.SetRequestID(reqID)
+	}
 	return err
 }
 
@@ -217,8 +263,8 @@ func (s *s3client) List(prefix, start, token, delimiter string, limit int64, fol
 	param := s3.ListObjectsV2Input{
 		Bucket:       &s.bucket,
 		Prefix:       &prefix,
-		MaxKeys:      &limit,
-		EncodingType: aws.String("url"),
+		MaxKeys:      aws.Int32(int32(limit)),
+		EncodingType: types.EncodingTypeUrl,
 	}
 	if start != "" {
 		param.StartAfter = aws.String(start)
@@ -229,7 +275,7 @@ func (s *s3client) List(prefix, start, token, delimiter string, limit int64, fol
 	if delimiter != "" {
 		param.Delimiter = aws.String(delimiter)
 	}
-	resp, err := s.s3.ListObjectsV2(&param)
+	resp, err := s.s3.ListObjectsV2(ctx, &param)
 	if err != nil {
 		return nil, false, "", err
 	}
@@ -245,8 +291,8 @@ func (s *s3client) List(prefix, start, token, delimiter string, limit int64, fol
 			return nil, false, "", fmt.Errorf("found invalid key %s from List, prefix: %s, marker: %s", oKey, prefix, start)
 		}
 		var sc = DefaultStorageClass
-		if o.StorageClass != nil {
-			sc = *o.StorageClass
+		if o.StorageClass != "" {
+			sc = string(o.StorageClass)
 		}
 		objs[i] = &obj{
 			oKey,
@@ -287,9 +333,9 @@ func (s *s3client) CreateMultipartUpload(key string) (*MultipartUpload, error) {
 		Key:    &key,
 	}
 	if s.sc != "" {
-		params.SetStorageClass(s.sc)
+		params.StorageClass = types.StorageClass(s.sc)
 	}
-	resp, err := s.s3.CreateMultipartUpload(params)
+	resp, err := s.s3.CreateMultipartUpload(ctx, params)
 	if err != nil {
 		return nil, err
 	}
@@ -297,7 +343,7 @@ func (s *s3client) CreateMultipartUpload(key string) (*MultipartUpload, error) {
 }
 
 func (s *s3client) UploadPart(key string, uploadID string, num int, body []byte) (*Part, error) {
-	n := int64(num)
+	n := int32(num)
 	params := &s3.UploadPartInput{
 		Bucket:     &s.bucket,
 		Key:        &key,
@@ -305,7 +351,7 @@ func (s *s3client) UploadPart(key string, uploadID string, num int, body []byte)
 		Body:       bytes.NewReader(body),
 		PartNumber: &n,
 	}
-	resp, err := s.s3.UploadPart(params)
+	resp, err := s.s3.UploadPart(ctx, params)
 	if err != nil {
 		return nil, err
 	}
@@ -313,12 +359,12 @@ func (s *s3client) UploadPart(key string, uploadID string, num int, body []byte)
 }
 
 func (s *s3client) UploadPartCopy(key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
-	resp, err := s.s3.UploadPartCopy(&s3.UploadPartCopyInput{
+	resp, err := s.s3.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
 		Bucket:          aws.String(s.bucket),
 		CopySource:      aws.String(s.bucket + "/" + srcKey),
 		CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", off, off+size-1)),
 		Key:             aws.String(key),
-		PartNumber:      aws.Int64(int64(num)),
+		PartNumber:      aws.Int32(int32(num)),
 		UploadId:        aws.String(uploadID),
 	})
 	if err != nil {
@@ -333,23 +379,22 @@ func (s *s3client) AbortUpload(key string, uploadID string) {
 		Key:      &key,
 		UploadId: &uploadID,
 	}
-	_, _ = s.s3.AbortMultipartUpload(params)
+	_, _ = s.s3.AbortMultipartUpload(ctx, params)
 }
 
 func (s *s3client) CompleteUpload(key string, uploadID string, parts []*Part) error {
-	var s3Parts []*s3.CompletedPart
+	var s3Parts []types.CompletedPart
 	for i := range parts {
-		n := new(int64)
-		*n = int64(parts[i].Num)
-		s3Parts = append(s3Parts, &s3.CompletedPart{ETag: &parts[i].ETag, PartNumber: n})
+		n := int32(parts[i].Num)
+		s3Parts = append(s3Parts, types.CompletedPart{ETag: &parts[i].ETag, PartNumber: &n})
 	}
 	params := &s3.CompleteMultipartUploadInput{
 		Bucket:          &s.bucket,
 		Key:             &key,
 		UploadId:        &uploadID,
-		MultipartUpload: &s3.CompletedMultipartUpload{Parts: s3Parts},
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: s3Parts},
 	}
-	_, err := s.s3.CompleteMultipartUpload(params)
+	_, err := s.s3.CompleteMultipartUpload(ctx, params)
 	return err
 }
 
@@ -359,7 +404,7 @@ func (s *s3client) ListUploads(marker string) ([]*PendingPart, string, error) {
 		KeyMarker: aws.String(marker),
 	}
 
-	result, err := s.s3.ListMultipartUploads(input)
+	result, err := s.s3.ListMultipartUploads(ctx, input)
 	if err != nil {
 		return nil, "", err
 	}
@@ -380,11 +425,11 @@ func (s *s3client) SetStorageClass(sc string) error {
 }
 
 func autoS3Region(bucketName, accessKey, secretKey string) (string, error) {
-	awsConfig := &aws.Config{
+	awsConfig := aws.Config{
 		HTTPClient: httpClient,
 	}
 	if accessKey != "" {
-		awsConfig.Credentials = credentials.NewStaticCredentials(accessKey, secretKey, "")
+		awsConfig.Credentials = credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")
 	}
 
 	var regions []string
@@ -396,30 +441,29 @@ func autoS3Region(bucketName, accessKey, secretKey string) (string, error) {
 
 	var (
 		err     error
-		ses     *session.Session
-		service *s3.S3
+		service *s3.Client
 		result  *s3.GetBucketLocationOutput
 	)
 	for _, r := range regions {
 		// try to get bucket location
-		awsConfig.Region = aws.String(r)
-		ses, err = session.NewSession(awsConfig)
+		awsConfig.Region = r
 		if err != nil {
 			return "", fmt.Errorf("fail to create aws session: %s", err)
 		}
-		ses.Handlers.Build.PushFront(disableSha256Func)
-		service = s3.New(ses)
-		result, err = service.GetBucketLocation(&s3.GetBucketLocationInput{
+		service = s3.NewFromConfig(awsConfig)
+		result, err = service.GetBucketLocation(ctx, &s3.GetBucketLocationInput{
 			Bucket: aws.String(bucketName),
 		})
 		if err == nil {
 			logger.Debugf("Get location of bucket %q from region %q endpoint success: %s",
-				bucketName, r, *result.LocationConstraint)
-			return *result.LocationConstraint, nil
+				bucketName, r, result.LocationConstraint)
+			return string(result.LocationConstraint), nil
 		}
-		if err1, ok := err.(awserr.Error); ok {
+
+		var err1 smithy.APIError
+		if errors.As(err, &err1) {
 			// continue to try other regions if the credentials are invalid, otherwise stop trying.
-			if errCode := err1.Code(); errCode != "InvalidAccessKeyId" && errCode != "InvalidToken" {
+			if errCode := err1.ErrorCode(); errCode != "InvalidAccessKeyId" && errCode != "InvalidToken" {
 				return "", err
 			}
 		}
@@ -544,20 +588,17 @@ func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) 
 	}
 
 	ssl := strings.ToLower(uri.Scheme) == "https"
-	awsConfig := &aws.Config{
-		Region:     &region,
-		DisableSSL: aws.Bool(!ssl),
+	awsConfig, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	awsConfig = aws.Config{
+		Region: region,
 	}
 
 	disable100Continue := strings.EqualFold(uri.Query().Get("disable-100-continue"), "true")
 	if disable100Continue {
 		logger.Infof("HTTP header 100-Continue is disabled")
-		awsConfig.S3Disable100Continue = aws.Bool(true)
-	}
-	disableMD5 := strings.EqualFold(uri.Query().Get("disable-content-md5"), "true")
-	if disableMD5 {
-		logger.Infof("HTTP header Content-MD5 is disabled")
-		awsConfig.S3DisableContentMD5Validation = &disableMD5
 	}
 	disableChecksum := strings.EqualFold(uri.Query().Get("disable-checksum"), "true")
 	if disableChecksum {
@@ -565,21 +606,27 @@ func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) 
 	}
 
 	if accessKey == "anonymous" {
-		awsConfig.Credentials = credentials.AnonymousCredentials
+		awsConfig.Credentials = aws.AnonymousCredentials{}
 	} else if accessKey != "" {
-		awsConfig.Credentials = credentials.NewStaticCredentials(accessKey, secretKey, token)
-	}
-	if ep != "" {
-		awsConfig.Endpoint = aws.String(ep)
-		awsConfig.S3ForcePathStyle = aws.Bool(defaultPathStyle())
+		awsConfig.Credentials = credentials.NewStaticCredentialsProvider(accessKey, secretKey, token)
 	}
 
-	ses, err := session.NewSession(awsConfig)
-	if err != nil {
-		return nil, fmt.Errorf("Fail to create aws session: %s", err)
+	extraOptions := func(opts *s3.Options) {
+		if ep != "" {
+			opts.BaseEndpoint = &ep
+			opts.UsePathStyle = defaultPathStyle()
+		}
+
+		if disable100Continue {
+			opts.ContinueHeaderThresholdBytes = -1
+		}
+
+		if !ssl {
+			opts.EndpointOptions.DisableHTTPS = true
+		}
 	}
-	ses.Handlers.Build.PushFront(disableSha256Func)
-	return &s3client{bucket: bucketName, s3: s3.New(ses, aws.NewConfig().WithHTTPClient(httpClient)), ses: ses, disableChecksum: disableChecksum}, nil
+
+	return &s3client{bucket: bucketName, s3: s3.NewFromConfig(awsConfig, reduceChecksumCalculations, extraOptions), disableChecksum: disableChecksum}, nil
 }
 
 func init() {

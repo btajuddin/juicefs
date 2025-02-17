@@ -29,12 +29,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/qiniu/go-sdk/v7/auth"
 	"github.com/qiniu/go-sdk/v7/storage"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 type qiniu struct {
@@ -204,20 +204,13 @@ func newQiniu(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 	} else {
 		region = endpoint[:strings.LastIndex(endpoint, "-")]
 	}
-	awsConfig := &aws.Config{
-		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, token),
-		Endpoint:         &endpoint,
-		Region:           &region,
-		DisableSSL:       aws.Bool(uri.Scheme == "http"),
-		S3ForcePathStyle: aws.Bool(true),
-		HTTPClient:       httpClient,
+	awsConfig := aws.Config{
+		Credentials: credentials.NewStaticCredentialsProvider(accessKey, secretKey, token),
+		Region:      region,
+		HTTPClient:  httpClient,
 	}
-	ses, err := session.NewSession(awsConfig)
-	if err != nil {
-		return nil, fmt.Errorf("aws session: %s", err)
-	}
-	ses.Handlers.Build.PushFront(disableSha256Func)
-	s3client := s3client{bucket: bucket, s3: s3.New(ses), ses: ses}
+
+	s3client := s3client{bucket: bucket, s3: s3.NewFromConfig(awsConfig, reduceChecksumCalculations, endpointOptions(endpoint, uri.Scheme == "http", true))}
 
 	cfg := storage.Config{
 		UseHTTPS: uri.Scheme == "https",

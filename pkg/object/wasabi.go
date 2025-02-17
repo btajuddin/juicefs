@@ -24,10 +24,9 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 type wasabi struct {
@@ -56,21 +55,13 @@ func newWasabi(endpoint, accessKey, secretKey, token string) (ObjectStorage, err
 	region := hostParts[2]
 	endpoint = uri.Host[len(bucket)+1:]
 
-	awsConfig := &aws.Config{
-		Region:           &region,
-		Endpoint:         &endpoint,
-		DisableSSL:       aws.Bool(!ssl),
-		S3ForcePathStyle: aws.Bool(false),
-		HTTPClient:       httpClient,
-		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, token),
+	awsConfig := aws.Config{
+		Region:      region,
+		HTTPClient:  httpClient,
+		Credentials: credentials.NewStaticCredentialsProvider(accessKey, secretKey, token),
 	}
 
-	ses, err := session.NewSession(awsConfig)
-	if err != nil {
-		return nil, fmt.Errorf("aws session: %s", err)
-	}
-	ses.Handlers.Build.PushFront(disableSha256Func)
-	return &wasabi{s3client{bucket: bucket, s3: s3.New(ses), ses: ses}}, nil
+	return &wasabi{s3client{bucket: bucket, s3: s3.NewFromConfig(awsConfig, reduceChecksumCalculations, endpointOptions(endpoint, !ssl, false))}}, nil
 }
 
 func init() {
